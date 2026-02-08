@@ -18,6 +18,7 @@ An intelligent video search system that enables natural language search across v
 - [License](#license)
 
 ---
+https://github.com/user-attachments/assets/7f635d45-547d-4873-859c-bec093df9854
 
 ## Features
 
