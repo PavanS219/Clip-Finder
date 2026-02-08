@@ -1,4 +1,4 @@
-# Clip Finder API
+# Clip Finder 
 
 An intelligent video search system that enables natural language search across video content using both text (speech) and visual (frame) analysis. Find any moment in your videos by describing what was said or what was shown on screen.
 
