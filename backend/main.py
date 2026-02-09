@@ -613,12 +613,15 @@ async def upload_youtube_url(request: Request, url: str):
     """Process YouTube URL"""
     client_ip = request.client.host
     
-    remaining = get_rate_limit_remaining(client_ip)
-    if remaining <= 0:
+    # FIX: Actually consume the rate limit by calling check_rate_limit()
+    if not check_rate_limit(client_ip):
         raise HTTPException(
             status_code=429,
             detail=f"Rate limit exceeded. Limit: {RATE_LIMIT}/day"
         )
+    
+    # Now get the remaining count (already decremented by check_rate_limit)
+    remaining = get_rate_limit_remaining(client_ip)
     
     if not url.strip():
         raise HTTPException(status_code=400, detail="URL cannot be empty")
@@ -637,7 +640,7 @@ async def upload_youtube_url(request: Request, url: str):
         "video_id": video_id,
         "url": url,
         "message": "YouTube download started.",
-        "remaining_uploads": remaining - 1
+        "remaining_uploads": remaining  # FIX: Don't subtract 1, already done by check_rate_limit()
     }
 
 async def download_and_process_youtube(video_id: str, url: str, video_path: str):
