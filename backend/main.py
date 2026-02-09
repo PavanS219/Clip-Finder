@@ -1,6 +1,6 @@
 from fastapi import FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict
 import os
@@ -20,8 +20,9 @@ import numpy as np
 from PIL import Image
 import torch
 import open_clip
+import io
 
-app = FastAPI(title="Clip Finder API - FIXED Visual Search")
+app = FastAPI(title="Clip Finder API - IMPROVED with Search Type Toggle")
 
 # CORS middleware
 app.add_middleware(
@@ -39,7 +40,7 @@ CLIPS_DIR = BASE_DIR / "clips"
 CACHE_DIR = BASE_DIR / "cache"
 LANCEDB_DIR = BASE_DIR / "lancedb_data"
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
-RATE_LIMIT = 50  # requests per day per IP
+RATE_LIMIT = 5  # requests per day per IP
 
 # Create directories
 for dir_path in [UPLOAD_DIR, CLIPS_DIR, CACHE_DIR, LANCEDB_DIR]:
@@ -50,6 +51,7 @@ for dir_path in [UPLOAD_DIR, CLIPS_DIR, CACHE_DIR, LANCEDB_DIR]:
 rate_limit_store = {}
 search_history = {}
 bookmarks = {}
+clip_preview_cache = {}
 
 # Global model cache
 _text_embedding_model = None
@@ -63,7 +65,7 @@ _lancedb_connection = None
 class SearchQuery(BaseModel):
     video_id: str
     query: str
-    search_type: str = "hybrid"  # "text", "visual", "hybrid"
+    search_type: str = "visual"  # CHANGED: Default is now "visual" instead of "hybrid"
     top_k: int = 10
 
 class ClipRequest(BaseModel):
@@ -455,6 +457,47 @@ def create_clip(video_path: str, start: float, end: float, output_path: str):
     except subprocess.TimeoutExpired:
         raise Exception("Clip creation timed out")
 
+def create_clip_preview(video_path: str, start: float, end: float) -> bytes:
+    """Create a low-quality preview clip in memory"""
+    if not check_ffmpeg():
+        raise Exception("FFmpeg not installed")
+    
+    duration = end - start
+    
+    # Create temporary output for preview
+    with tempfile.NamedTemporaryFile(suffix='.mp4', delete=False) as temp_file:
+        temp_path = temp_file.name
+    
+    try:
+        cmd = [
+            "ffmpeg", "-i", str(video_path),
+            "-ss", str(start),
+            "-t", str(duration),
+            "-vf", "scale=640:-2",  # Lower resolution for preview
+            "-c:v", "libx264",
+            "-crf", "28",  # Lower quality
+            "-preset", "ultrafast",
+            "-c:a", "aac",
+            "-b:a", "64k",  # Lower audio bitrate
+            "-movflags", "+faststart",
+            temp_path, "-y"
+        ]
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            raise Exception(f"Preview creation failed: {result.stderr}")
+        
+        # Read the file into memory
+        with open(temp_path, 'rb') as f:
+            video_bytes = f.read()
+        
+        return video_bytes
+        
+    finally:
+        # Clean up temp file
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+
 # API Endpoints
 @app.get("/")
 async def root():
@@ -475,8 +518,8 @@ async def root():
     device = "CUDA" if torch.cuda.is_available() else "CPU"
     
     return {
-        "message": "Clip Finder API - FIXED Visual Search",
-        "version": "6.0.0 - FIXED",
+        "message": "Clip Finder API - WITH SEARCH TYPE TOGGLE",
+        "version": "7.0.0 - Visual/Text/Hybrid Search Modes",
         "status": "running",
         "device": device,
         "dependencies": {
@@ -484,12 +527,14 @@ async def root():
             "lancedb": lancedb_status,
             "openclip": clip_status
         },
-        "fixes": [
-            "✓ Proper CLIP text encoding for visual queries",
-            "✓ Direct image-to-query matching",
-            "✓ Separated text and visual search paths",
-            "✓ 1-second frame intervals for better coverage",
-            "✓ Pure visual similarity scoring"
+        "features": [
+            "✓ Visual search (CLIP) - Default mode",
+            "✓ Text search (Sentence-Transformers)",
+            "✓ Hybrid search (Both combined)",
+            "✓ User can toggle between modes",
+            "✓ Clean results without cross-contamination",
+            "✓ 1-second frame intervals",
+            "✓ Clip preview & download"
         ]
     }
 
@@ -500,6 +545,18 @@ async def health_check():
         "status": "healthy",
         "ffmpeg": check_ffmpeg(),
         "device": "cuda" if torch.cuda.is_available() else "cpu"
+    }
+
+@app.get("/rate-limit-status")
+async def rate_limit_status(request: Request):
+    """Get rate limit status for current IP"""
+    client_ip = request.client.host
+    remaining = get_rate_limit_remaining(client_ip)
+    
+    return {
+        "remaining": remaining,
+        "total": RATE_LIMIT,
+        "reset_time": (datetime.now() + timedelta(days=1)).replace(hour=0, minute=0, second=0).isoformat()
     }
 
 @app.post("/upload")
@@ -547,7 +604,7 @@ async def upload_video(request: Request, file: UploadFile = File(...)):
     return {
         "video_id": video_id,
         "filename": file.filename,
-        "message": "Upload successful. Processing with FIXED visual search.",
+        "message": "Upload successful. Processing with visual/text search enabled.",
         "remaining_uploads": remaining - 1
     }
 
@@ -606,7 +663,7 @@ async def download_and_process_youtube(video_id: str, url: str, video_path: str)
             json.dump(status, f)
 
 async def process_video_background(video_id: str, video_path: str):
-    """Background task to process video - FIXED VERSION"""
+    """Background task to process video"""
     cache_file = CACHE_DIR / f"{video_id}.json"
     
     try:
@@ -741,7 +798,7 @@ async def process_video_background(video_id: str, video_path: str):
             "text_table_name": text_table_name,
             "visual_table_name": visual_table_name,
             "frame_interval": 1,
-            "model": "OpenCLIP ViT-B-32 + LAION-2B - FIXED"
+            "model": "OpenCLIP ViT-B-32 + LAION-2B + Sentence-Transformers"
         }
         
         data_file = CACHE_DIR / f"{video_id}_data.json"
@@ -751,7 +808,7 @@ async def process_video_background(video_id: str, video_path: str):
         # Complete
         status["status"] = "completed"
         status["progress"] = 1.0
-        status["message"] = "Processing complete! Visual search is now working correctly."
+        status["message"] = "Processing complete! Visual/Text/Hybrid search ready."
         with open(cache_file, "w") as f:
             json.dump(status, f)
         
@@ -793,7 +850,7 @@ async def get_status(video_id: str):
 
 @app.post("/search")
 async def search_video(query: SearchQuery):
-    """FIXED search with proper visual/text separation"""
+    """IMPROVED search with proper visual/text/hybrid separation"""
     data_file = CACHE_DIR / f"{query.video_id}_data.json"
     
     if not data_file.exists():
@@ -812,7 +869,7 @@ async def search_video(query: SearchQuery):
             query_embeddings = await get_text_embeddings([query.query])
             query_embedding = query_embeddings[0]
             
-            # Search in text segments using in-memory data (no LanceDB)
+            # Search in text segments using in-memory data
             text_segments = data.get("segments", [])
             text_embeddings = data.get("text_embeddings", [])
             
@@ -882,7 +939,9 @@ async def search_video(query: SearchQuery):
             
             # Take top matches
             top_matches = visual_matches[:query.top_k * 2]
-            print(f"Top match similarity: {top_matches[0]['similarity']:.3f} at {top_matches[0]['timestamp']}s")
+            
+            if top_matches:
+                print(f"Top match similarity: {top_matches[0]['similarity']:.3f} at {top_matches[0]['timestamp']}s")
             
             # Convert to results
             for match in top_matches:
@@ -940,7 +999,7 @@ async def search_video(query: SearchQuery):
                 
                 combined_score = similarity + keyword_bonus
                 
-                if combined_score > 0.3:
+                if combined_score > 0.4:  # Higher threshold for hybrid to reduce noise
                     text_results.append({
                         "timestamp": seg["start"],
                         "text": seg["text"],
@@ -964,7 +1023,7 @@ async def search_video(query: SearchQuery):
                     frame_embedding.tolist()
                 )
                 
-                if similarity > 0.2:
+                if similarity > 0.25:  # Higher threshold for hybrid
                     timestamp = vd["timestamp"]
                     corresponding_text = f"Visual content at {timestamp:.1f}s"
                     for seg in data.get("segments", []):
@@ -1020,7 +1079,7 @@ async def search_video(query: SearchQuery):
         "results": unique_results[:query.top_k],
         "total_matches": len(unique_results),
         "search_type": query.search_type,
-        "model": "OpenCLIP ViT-B-32 + LAION-2B - FIXED"
+        "model": "OpenCLIP ViT-B-32 + LAION-2B + Sentence-Transformers"
     }
 
 @app.get("/frame/{video_id}/{frame_number}")
@@ -1094,8 +1153,46 @@ async def create_video_clip(clip_req: ClipRequest):
     
     return {
         "clip_url": f"/download-clip/{clip_filename}",
-        "filename": clip_filename
+        "filename": clip_filename,
+        "message": "Clip created successfully"
     }
+
+@app.get("/preview-clip/{video_id}")
+async def preview_clip(video_id: str, start_time: float, end_time: float):
+    """Generate and stream a preview of the clip"""
+    data_file = CACHE_DIR / f"{video_id}_data.json"
+    
+    if not data_file.exists():
+        raise HTTPException(status_code=404, detail="Video not found")
+    
+    with open(data_file, "r") as f:
+        data = json.load(f)
+    
+    video_path = data["video_path"]
+    
+    # Check cache
+    cache_key = f"{video_id}_{int(start_time)}_{int(end_time)}"
+    if cache_key in clip_preview_cache:
+        video_bytes = clip_preview_cache[cache_key]
+    else:
+        try:
+            video_bytes = create_clip_preview(video_path, start_time, end_time)
+            # Cache the preview (limit cache size)
+            if len(clip_preview_cache) > 20:
+                # Remove oldest entry
+                clip_preview_cache.pop(next(iter(clip_preview_cache)))
+            clip_preview_cache[cache_key] = video_bytes
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Preview creation failed: {str(e)}")
+    
+    return StreamingResponse(
+        io.BytesIO(video_bytes),
+        media_type="video/mp4",
+        headers={
+            "Content-Disposition": f"inline; filename=preview_{video_id}.mp4",
+            "Cache-Control": "public, max-age=3600"
+        }
+    )
 
 @app.get("/download-clip/{filename}")
 async def download_clip(filename: str):
@@ -1108,7 +1205,10 @@ async def download_clip(filename: str):
     return FileResponse(
         clip_path,
         media_type="video/mp4",
-        filename=filename
+        filename=filename,
+        headers={
+            "Content-Disposition": f"attachment; filename={filename}"
+        }
     )
 
 @app.get("/video/{video_id}")
@@ -1173,6 +1273,11 @@ async def delete_video(video_id: str):
     except Exception as e:
         print(f"Error deleting LanceDB tables: {e}")
     
+    # Clear cache entries
+    cache_keys_to_remove = [k for k in clip_preview_cache.keys() if k.startswith(video_id)]
+    for key in cache_keys_to_remove:
+        del clip_preview_cache[key]
+    
     if video_id in search_history:
         del search_history[video_id]
     if video_id in bookmarks:
@@ -1184,14 +1289,18 @@ if __name__ == "__main__":
     import uvicorn
     
     print("=" * 80)
-    print("CLIP FINDER API - FIXED VERSION v6.0")
+    print("CLIP FINDER API - VERSION 7.0 - WITH SEARCH TYPE TOGGLE")
     print("=" * 80)
-    print("KEY FIXES:")
-    print("✓ Visual search now uses CLIP text encoder for queries")
-    print("✓ Direct image-to-query matching (no text transcript interference)")
-    print("✓ Separated search paths for text vs visual")
+    print("FEATURES:")
+    print("✓ Visual search (CLIP) - Default mode for image/scene queries")
+    print("✓ Text search (Sentence-Transformers) - For spoken word queries")
+    print("✓ Hybrid search - Combines both (use with caution)")
+    print("✓ User can toggle between search modes in UI")
+    print("✓ Clean results without cross-contamination")
     print("✓ 1-second frame intervals for better coverage")
-    print("✓ Pure cosine similarity for visual matches")
+    print("✓ Clip preview before download")
+    print("✓ High-quality clip downloads")
+    print("✓ Rate limiting (5 uploads/day per IP)")
     print("=" * 80)
     print(f"Device: {'CUDA (GPU)' if torch.cuda.is_available() else 'CPU'}")
     print("=" * 80)
