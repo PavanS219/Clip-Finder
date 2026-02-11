@@ -319,7 +319,7 @@ export CACHE_DIR="/path/to/cache"
 export LANCEDB_DIR="/path/to/lancedb"
 
 # Set rate limits
-export RATE_LIMIT=50  # uploads per day per IP
+export RATE_LIMIT=5  # uploads per day per IP
 
 # Set file size limit (in bytes)
 export MAX_FILE_SIZE=524288000  # 500MB
@@ -329,7 +329,7 @@ export MAX_FILE_SIZE=524288000  # 500MB
 Edit `main.py` to modify:
 ```python
 MAX_FILE_SIZE = 500 * 1024 * 1024  # 500MB
-RATE_LIMIT = 50  # requests per day per IP
+RATE_LIMIT = 5  # requests per day per IP
 ```
 
 ---
